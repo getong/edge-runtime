@@ -371,6 +371,21 @@ impl RunOptionsBuilder {
   }
 }
 
+fn cleanup_js_runtime(runtime: &mut JsRuntime) {
+  let isolate = runtime.v8_isolate();
+
+  assert_isolate_not_locked(isolate);
+  let locker = unsafe {
+    Locker::new(std::mem::transmute::<&mut Isolate, &mut Isolate>(isolate))
+  };
+
+  isolate.set_slot(locker);
+
+  {
+    let _scope = runtime.handle_scope();
+  }
+}
+
 pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
   pub runtime_state: Arc<RuntimeState>,
   pub js_runtime: ManuallyDrop<JsRuntime>,
@@ -406,17 +421,7 @@ impl<RuntimeContext> Drop for DenoRuntime<RuntimeContext> {
       );
     }
 
-    self.assert_isolate_not_locked();
-    let isolate = self.js_runtime.v8_isolate();
-    let locker = unsafe {
-      Locker::new(std::mem::transmute::<&mut Isolate, &mut Isolate>(isolate))
-    };
-
-    isolate.set_slot(locker);
-
-    {
-      let _scope = self.js_runtime.handle_scope();
-    }
+    cleanup_js_runtime(&mut self.js_runtime);
 
     unsafe {
       ManuallyDrop::drop(&mut self.js_runtime);
@@ -461,6 +466,7 @@ where
       static_patterns,
       maybe_s3_fs_config,
       maybe_tmp_fs_config,
+      maybe_otel_config,
       ..
     } = init_opts.unwrap();
 
@@ -1016,7 +1022,7 @@ where
         }
 
         // from this moment on, using `v8::Locker` is enforced.
-        Ok(bootstrap)
+        Ok(ScopeGuard::into_inner(bootstrap))
       })
     }
     .await;
