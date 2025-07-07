@@ -194,3 +194,6 @@ impl BlockingScopeCPUUsageMetricExt for &mut OpState {
     })
   }
 }
+
+#[derive(Debug, Clone)]
+pub struct RuntimeOtelAttribute(pub opentelemetry::Value);
