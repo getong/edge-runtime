@@ -394,21 +394,6 @@ fn cleanup_js_runtime(runtime: &mut JsRuntime) {
   }
 }
 
-fn cleanup_js_runtime(runtime: &mut JsRuntime) {
-  let isolate = runtime.v8_isolate();
-
-  assert_isolate_not_locked(isolate);
-  let locker = unsafe {
-    Locker::new(std::mem::transmute::<&mut Isolate, &mut Isolate>(isolate))
-  };
-
-  isolate.set_slot(locker);
-
-  {
-    let _scope = runtime.handle_scope();
-  }
-}
-
 pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
   pub runtime_state: Arc<RuntimeState>,
   pub js_runtime: ManuallyDrop<JsRuntime>,
