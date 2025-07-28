@@ -409,7 +409,9 @@ const MAKE_HARD_ERR_FN = (msg) => {
 const DENIED_DENO_FS_API_LIST = ObjectKeys(fsVars)
   .reduce(
     (acc, it) => {
-      acc[it] = MAKE_HARD_ERR_FN(`Deno.${it} is blocklisted`);
+      if (fsVars[it] !== void 0) {
+        acc[it] = MAKE_HARD_ERR_FN(`Deno.${it} is blocklisted`);
+      }
       return acc;
     },
     {},
@@ -657,6 +659,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
       "cwd": true,
 
       "open": true,
+      "lstat": true,
       "stat": true,
       "realPath": true,
       "realPathSync": true,
@@ -675,6 +678,7 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
       "addSignalListener": "mock",
       "removeSignalListener": "mock",
 
+      "lstatSync": "allowIfRuntimeIsInInit",
       "statSync": "allowIfRuntimeIsInInit",
       "removeSync": "allowIfRuntimeIsInInit",
       "writeFileSync": "allowIfRuntimeIsInInit",
@@ -691,9 +695,8 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
     };
 
     if (ctx?.useReadSyncFileAPI) {
-      apisToBeOverridden["readFileSync"] = true;
-      apisToBeOverridden["readTextFileSync"] = true;
-      apisToBeOverridden["openSync"] = true;
+      apisToBeOverridden["readFileSync"] = "warnIfRuntimeIsAlreadyInit";
+      apisToBeOverridden["readTextFileSync"] = "warnIfRuntimeIsAlreadyInit";
     }
 
     const apiNames = ObjectKeys(apisToBeOverridden);
@@ -725,6 +728,20 @@ globalThis.bootstrapSBEdge = (opts, ctx) => {
                 return originalFn(...args);
               } else {
                 return blocklistedFn();
+              }
+            };
+            break;
+          }
+          case "warnIfRuntimeIsAlreadyInit": {
+            const originalFn = Deno[name];
+            Deno[name] = (...args) => {
+              if (ops.op_is_runtime_init()) {
+                return originalFn(...args);
+              } else {
+                globalThis.console.error(
+                  `WARNING: Do not use Deno.${name} inside the async callback. This has performance impacts and will be disallowed in the future.\nUse the async version instead.`,
+                );
+                return originalFn(...args);
               }
             };
             break;

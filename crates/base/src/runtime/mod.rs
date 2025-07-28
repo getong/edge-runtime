@@ -25,6 +25,7 @@ use base_rt::DenoRuntimeDropToken;
 use base_rt::DropToken;
 use base_rt::RuntimeOtelExtraAttributes;
 use base_rt::RuntimeState;
+use base_rt::RuntimeWaker;
 use cooked_waker::IntoWaker;
 use cooked_waker::WakeRef;
 use cpu_timer::CPUTimer;
@@ -87,6 +88,7 @@ use ext_runtime::MemCheckWaker;
 use ext_runtime::PromiseMetrics;
 use ext_workers::context::UserWorkerMsgs;
 use ext_workers::context::WorkerContextInitOpts;
+use ext_workers::context::WorkerKind;
 use ext_workers::context::WorkerRuntimeOpts;
 use fs::deno_compile_fs::DenoCompileFileSystem;
 use fs::prefix_fs::PrefixFs;
@@ -158,6 +160,11 @@ pub static SHOULD_USE_VERBOSE_DEPRECATED_API_WARNING: OnceCell<bool> =
 pub static SHOULD_INCLUDE_MALLOCED_MEMORY_ON_MEMCHECK: OnceCell<bool> =
   OnceCell::new();
 pub static MAYBE_DENO_VERSION: OnceCell<String> = OnceCell::new();
+
+pub static MAIN_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static MAIN_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static EVENT_WORKER_INITIAL_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
+pub static EVENT_WORKER_MAX_HEAP_SIZE_MIB: OnceCell<u64> = OnceCell::new();
 
 #[ctor]
 fn init_v8_platform() {
@@ -387,6 +394,21 @@ fn cleanup_js_runtime(runtime: &mut JsRuntime) {
   }
 }
 
+fn cleanup_js_runtime(runtime: &mut JsRuntime) {
+  let isolate = runtime.v8_isolate();
+
+  assert_isolate_not_locked(isolate);
+  let locker = unsafe {
+    Locker::new(std::mem::transmute::<&mut Isolate, &mut Isolate>(isolate))
+  };
+
+  isolate.set_slot(locker);
+
+  {
+    let _scope = runtime.handle_scope();
+  }
+}
+
 pub struct DenoRuntime<RuntimeContext = DefaultRuntimeContext> {
   pub runtime_state: Arc<RuntimeState>,
   pub js_runtime: ManuallyDrop<JsRuntime>,
@@ -471,6 +493,7 @@ where
       ..
     } = init_opts.unwrap();
 
+    let waker = Arc::<AtomicWaker>::default();
     let drop_token = CancellationToken::default();
     let is_user_worker = conf.is_user_worker();
     let is_some_entry_point = maybe_entrypoint.is_some();
@@ -486,6 +509,7 @@ where
       .unwrap_or_else(|| get_default_permissions(conf.to_worker_kind()));
 
     struct Bootstrap {
+      waker: Arc<AtomicWaker>,
       js_runtime: JsRuntime,
       mem_check: Arc<MemCheck>,
       has_inspector: bool,
@@ -662,15 +686,22 @@ where
           let tmp_fs =
             TmpFs::try_from(maybe_tmp_fs_config.unwrap_or_default())?;
           let tmp_fs_actual_path = tmp_fs.actual_path().to_path_buf();
-          let fs = PrefixFs::new("/tmp", tmp_fs.clone(), Some(base_fs))
+          let mut fs = PrefixFs::new("/tmp", tmp_fs.clone(), Some(base_fs))
             .tmp_dir("/tmp")
             .add_fs(tmp_fs_actual_path, tmp_fs);
+
+          fs
+            .set_runtime_state(&runtime_state);
 
           Ok(
             if let Some(s3_fs) =
               maybe_s3_fs_config.map(S3Fs::new).transpose()?
             {
-              (Arc::new(fs.add_fs("/s3", s3_fs.clone())), Some(s3_fs))
+              let mut s3_prefix_fs = fs.add_fs("/s3", s3_fs.clone());
+
+              s3_prefix_fs.set_check_sync_api(is_user_worker);
+
+              (Arc::new(s3_prefix_fs), Some(s3_fs))
             } else {
               (Arc::new(fs), None)
             },
@@ -779,39 +810,65 @@ where
         let beforeunload_mem_threshold =
           ArcSwapOption::<u64>::from_pointee(None);
 
-        if conf.is_user_worker() {
-          let conf = maybe_user_conf.unwrap();
-          let memory_limit_bytes = mib_to_bytes(conf.memory_limit_mb) as usize;
+        match conf.to_worker_kind() {
+          WorkerKind::UserWorker => {
+            let conf = maybe_user_conf.unwrap();
+            let memory_limit_bytes = mib_to_bytes(conf.memory_limit_mb) as usize;
 
-          beforeunload_mem_threshold.store(
-            flags
-              .beforeunload_memory_pct
-              .and_then(|it| percentage_value(memory_limit_bytes as u64, it))
-              .map(Arc::new),
-          );
-
-          if conf.cpu_time_hard_limit_ms > 0 {
-            beforeunload_cpu_threshold.store(
+            beforeunload_mem_threshold.store(
               flags
-                .beforeunload_cpu_pct
-                .and_then(|it| {
-                  percentage_value(conf.cpu_time_hard_limit_ms, it)
-                })
+                .beforeunload_memory_pct
+                .and_then(|it| percentage_value(memory_limit_bytes as u64, it))
                 .map(Arc::new),
             );
+
+            if conf.cpu_time_hard_limit_ms > 0 {
+              beforeunload_cpu_threshold.store(
+                flags
+                  .beforeunload_cpu_pct
+                  .and_then(|it| {
+                    percentage_value(conf.cpu_time_hard_limit_ms, it)
+                  })
+                  .map(Arc::new),
+              );
+            }
+
+            let allocator = CustomAllocator::new(memory_limit_bytes);
+
+            allocator.set_waker(mem_check.waker.clone());
+
+            mem_check.limit = Some(memory_limit_bytes);
+            create_params = Some(
+              v8::CreateParams::default()
+                .heap_limits(mib_to_bytes(0) as usize, memory_limit_bytes)
+                .array_buffer_allocator(allocator.into_v8_allocator()),
+            )
           }
 
-          let allocator = CustomAllocator::new(memory_limit_bytes);
+          kind => {
+            assert_ne!(kind, WorkerKind::UserWorker);
+            let initial_heap_size = match kind {
+              WorkerKind::MainWorker => &MAIN_WORKER_INITIAL_HEAP_SIZE_MIB,
+              WorkerKind::EventsWorker => &EVENT_WORKER_INITIAL_HEAP_SIZE_MIB,
+              _ => unreachable!(),
+            };
+            let max_heap_size = match kind {
+              WorkerKind::MainWorker => &MAIN_WORKER_MAX_HEAP_SIZE_MIB,
+              WorkerKind::EventsWorker => &EVENT_WORKER_MAX_HEAP_SIZE_MIB,
+              _ => unreachable!(),
+            };
 
-          allocator.set_waker(mem_check.waker.clone());
+            let initial_heap_size = initial_heap_size.get().cloned().unwrap_or_default();
+            let max_heap_size = max_heap_size.get().cloned().unwrap_or_default();
 
-          mem_check.limit = Some(memory_limit_bytes);
-          create_params = Some(
-            v8::CreateParams::default()
-              .heap_limits(mib_to_bytes(0) as usize, memory_limit_bytes)
-              .array_buffer_allocator(allocator.into_v8_allocator()),
-          )
-        };
+            if max_heap_size > 0 {
+              create_params = Some(v8::CreateParams::default().heap_limits(
+                mib_to_bytes(initial_heap_size) as usize,
+                mib_to_bytes(max_heap_size) as usize,
+              ));
+            }
+          }
+        }
 
         let mem_check = Arc::new(mem_check);
         let runtime_options = RuntimeOptions {
@@ -879,6 +936,7 @@ where
           op_state.put(promise_metrics.clone());
           op_state.put(runtime_state.clone());
           op_state.put(GlobalMainContext(main_context));
+          op_state.put(RuntimeWaker(waker.clone()))
         }
 
         {
@@ -913,6 +971,7 @@ where
         }
 
         Ok(Bootstrap {
+          waker,
           js_runtime,
           mem_check,
           has_inspector,
@@ -1029,6 +1088,7 @@ where
     .await;
 
     let Bootstrap {
+      waker,
       mut js_runtime,
       mem_check,
       main_module_url,
@@ -1169,7 +1229,7 @@ where
       promise_metrics,
 
       mem_check,
-      waker: Arc::default(),
+      waker,
 
       beforeunload_cpu_threshold: Arc::new(beforeunload_cpu_threshold),
       beforeunload_mem_threshold: Arc::new(beforeunload_mem_threshold),
