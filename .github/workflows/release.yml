@@ -118,6 +118,7 @@ jobs:
           build-args: |
             GIT_V_TAG=${{ needs.release.outputs.version }}
             ONNXRUNTIME_VERSION=${{ env.ONNXRUNTIME_VERSION }}
+            FEATURES=cli/mimalloc
 
   merge_manifest:
     needs: [release, publish_x86, publish_arm]

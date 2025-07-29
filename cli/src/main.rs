@@ -35,6 +35,8 @@ mod flags;
 
 #[cfg(not(feature = "tracing"))]
 mod logger;
+#[cfg(feature = "mimalloc")]
+mod mimalloc_alloc;
 
 fn main() -> Result<ExitCode, anyhow::Error> {
   resolve_deno_runtime_env();
